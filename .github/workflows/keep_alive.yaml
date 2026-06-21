@@ -1,0 +1,130 @@
+name: Wake Leech Bot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Telethon and Requests
+        run: pip install telethon requests
+
+      - name: Run Smart Group Monitor Loop
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          SESSION_STR: ${{ secrets.TG_SESSION_STRING }}
+          TG_GROUP_ID: ${{ secrets.TG_GROUP_ID }}
+        run: |
+          cat << 'EOF' > group_loop.py
+          import os
+          import time
+          import asyncio
+          import requests
+          import subprocess
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+          from telethon.tl.types import PeerChannel
+
+          BOT_WEB_URL = "https://jjjjjjjj-haps-leech-bot1.hf.space" 
+          NTFY_TOPIC = "JAI_HO"
+
+          async def send_group_ping():
+              try:
+                  client = TelegramClient(StringSession(os.environ['SESSION_STR']), int(os.environ['API_ID']), os.environ['API_HASH'])
+                  await client.connect()
+                  
+                  # Clean the ID and match Telethon's expected entity format
+                  raw_group_id = os.environ['TG_GROUP_ID'].replace("-100", "")
+                  channel_peer = PeerChannel(channel_id=int(raw_group_id))
+                  
+                  input_entity = await client.get_input_entity(channel_peer)
+                  payload = '/leech https://raw.githubusercontent.com/ncw/rclone/master/README.md'
+                  
+                  await client.send_message(input_entity, payload)
+                  print('Active wake payload deployed to group successfully!')
+                  await client.disconnect()
+                  return 'YES'
+              except Exception as e:
+                  print(f'Error sending group ping: {e}')
+                  return 'NO'
+
+          def check_hf_status():
+              try:
+                  res = requests.get(BOT_WEB_URL, timeout=15)
+                  return res.status_code in [200, 503, 302]
+              except Exception:
+                  pass
+              return False
+
+          def send_ntfy_report(bot_status, script_status):
+              msg = f"• Telegram Ping: {script_status}\n• Downloader Bot: {'🟢 ONLINE' if bot_status else '🔴 OFFLINE'}"
+              
+              # Smart Priority System: Quiet (3) if fine, Loud Crazy Vibration (5) if down!
+              if script_status == 'YES' and bot_status:
+                  priority = "3"
+                  title = "📊 Leech System: OK"
+              else:
+                  priority = "5"
+                  title = "🚨 EMERGENCY: Leech System Down!"
+              
+              cmd = [
+                  "curl", 
+                  "-H", f"X-Priority: {priority}", 
+                  "-H", f"X-Title: {title}", 
+                  "-d", msg, 
+                  f"https://ntfy.sh/{NTFY_TOPIC}"
+              ]
+              try:
+                  subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              except Exception as e:
+                  print(f"Failed to dispatch curl: {e}")
+
+          async def main():
+              print("Starting continuous group automation loop...")
+              start_time = time.time()
+              max_duration = 320 * 60 
+              
+              while (time.time() - start_time) < max_duration:
+                  script_status = await send_group_ping()
+                  bot_is_online = check_hf_status()
+                  send_ntfy_report(bot_is_online, script_status)
+                  
+                  print("Sleeping for 10 minutes...")
+                  await asyncio.sleep(600)
+              
+              print("Safe loop duration reached.")
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          EOF
+
+          python group_loop.py
+
+      - name: Trigger next run via API Curl Loop
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          curl -H "X-Priority: 5" -H "X-Title: 🔄 Cycle Handover" -d "Booting fresh loop container instance..." https://ntfy.sh/JAI_HO
+          
+          curl -X POST \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+          https://api.github.com/repos/${{ github.repository }}/actions/workflows/keep_alive.yml/dispatches \
+          -d '{"ref":"main"}'
