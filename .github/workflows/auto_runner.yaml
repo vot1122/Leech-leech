@@ -1,11 +1,12 @@
-name: System Sentinel Pro
+name: System Sentinel Enterprise
 
 on:
   workflow_dispatch:
 
 permissions:
   actions: write
-  contents: read
+  contents: write
+  issues: write
 
 jobs:
   sentinel-daemon:
@@ -21,112 +22,394 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install High-Performance Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyrogram tgcrypto requests psutil
+          pip install requests psutil
 
-      - name: Launch Sentinel Daemon
+      - name: Launch Enterprise Sentinel Daemon
         env:
-          TG_APP_ID: ${{ secrets.TG_APP_ID }}
-          TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
-          TG_SESSION: ${{ secrets.TG_SESSION }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
         run: |
           cat << 'EOF' > sentinel.py
           import os
+          import sys
           import time
-          import asyncio
+          import json
+          import base64
+          import socket
+          import ssl
+          import random
           import requests
           import psutil
           import subprocess
-          from pyrogram import Client
+          from datetime import datetime, timezone
 
-          # System Configuration
-          TARGET_BOT_URL = "https://jjjjjjjj-haps-leech-bot1.hf.space" 
-          NTFY_TOPIC = "JAI_HO"
-          SLEEP_INTERVAL = 600  # 10 Minutes
+          # Configuration Matrix
+          TARGET_ENDPOINTS = [
+              {"name": "Leech Downloader Bot", "url": "https://jjjjjjjj-haps-leech-bot1.hf.space"}
+          ]
+          
+          NTFY_TOPIC = os.environ.get('NTFY_TOPIC', '')
+          DISCORD_WEBHOOK = os.environ.get('DISCORD_WEBHOOK', '')
+          PAT_TOKEN = os.environ.get('PAT_TOKEN', '')
+          GH_REPO = os.environ.get('GH_REPO', '')
+
+          NORMAL_INTERVAL_SEC = 600  # 10 Minutes
+          PANIC_INTERVAL_SEC = 120   # 2 Minutes
           MAX_RUNTIME_SEC = 320 * 60  # ~5.3 Hours
 
-          def get_system_metrics():
-              """Collects container resource metrics."""
-              ram = psutil.virtual_memory()
-              cpu = psutil.cpu_percent(interval=1)
-              return f"RAM: {ram.percent}% | CPU: {cpu}%"
+          # State Tracking
+          history_log = []
+          last_status = True
+          active_incident_issue_id = None
+          last_down_time = None
+          last_up_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-          async def dispatch_telegram_wake():
-              """Dispatches wake payload to the target Telegram Group."""
+          def get_ssl_expiry(url):
               try:
-                  app = Client(
-                      "sentinel_session",
-                      api_id=int(os.environ['TG_APP_ID']),
-                      api_hash=os.environ['TG_APP_HASH'],
-                      session_string=os.environ['TG_SESSION'],
-                      in_memory=True
+                  hostname = url.split("//")[-1].split("/")[0]
+                  context = ssl.create_default_context()
+                  with socket.create_connection((hostname, 443), timeout=5) as sock:
+                      with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                          cert = ssock.getpeercert()
+                          expire_date = datetime.strptime(cert['notAfter'], "%b %d %H:%M:%S %Y %Z")
+                          days_left = (expire_date - datetime.utcnow()).days
+                          return f"{days_left} Days"
+              except Exception:
+                  return "Unknown"
+
+          def check_dns(url):
+              try:
+                  hostname = url.split("//")[-1].split("/")[0]
+                  return socket.gethostbyname(hostname)
+              except Exception:
+                  return "FAILED"
+
+          def get_github_rate_limit():
+              if not PAT_TOKEN:
+                  return "N/A"
+              try:
+                  headers = {"Authorization": f"Bearer {PAT_TOKEN}"}
+                  res = requests.get("https://api.github.com/rate_limit", headers=headers, timeout=5)
+                  if res.status_code == 200:
+                      remaining = res.json()['resources']['core']['remaining']
+                      limit = res.json()['resources']['core']['limit']
+                      return f"{remaining}/{limit}"
+              except Exception:
+                  pass
+              return "N/A"
+
+          def ping_endpoints():
+              headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+              overall_healthy = True
+              results = []
+
+              for ep in TARGET_ENDPOINTS:
+                  ep_healthy = False
+                  latency = 0
+                  for attempt in range(3):
+                      try:
+                          start = time.time()
+                          res = requests.get(ep["url"], headers=headers, timeout=12)
+                          latency = int((time.time() - start) * 1000)
+                          if res.status_code in [200, 302, 503]:
+                              ep_healthy = True
+                              break
+                      except Exception:
+                          time.sleep(1)
+                  
+                  if not ep_healthy:
+                      overall_healthy = False
+
+                  results.append({
+                      "name": ep["name"],
+                      "url": ep["url"],
+                      "status": ep_healthy,
+                      "latency_ms": latency
+                  })
+
+              return overall_healthy, results
+
+          # --- FEATURE 1: MULTI-TIER JSON HEALTH LOG ARCHIVING ---
+          def archive_json_logs(results, overall_status):
+              if not PAT_TOKEN or not GH_REPO:
+                  return
+
+              now = datetime.now(timezone.utc)
+              year_str = now.strftime("%Y")
+              month_str = now.strftime("%Y_%m")
+              week_str = now.strftime("%Y_W%V")
+
+              log_payload = {
+                  "timestamp": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                  "overall_status": "ONLINE" if overall_status else "OFFLINE",
+                  "endpoints": results,
+                  "metrics": {
+                      "ram_percent": psutil.virtual_memory().percent,
+                      "disk_percent": psutil.disk_usage('/').percent
+                  }
+              }
+
+              files_to_update = [
+                  f"logs/weekly/{week_str}.json",
+                  f"logs/monthly/{month_str}.json",
+                  f"logs/yearly/{year_str}.json"
+              ]
+
+              headers = {
+                  "Authorization": f"Bearer {PAT_TOKEN}",
+                  "Accept": "application/vnd.github+json"
+              }
+
+              for file_path in files_to_update:
+                  url = f"https://api.github.com/repos/{GH_REPO}/contents/{file_path}"
+                  existing_data = []
+                  sha = None
+
+                  get_res = requests.get(url, headers=headers)
+                  if get_res.status_code == 200:
+                      data_json = get_res.json()
+                      sha = data_json.get("sha")
+                      try:
+                          decoded = base64.b64decode(data_json["content"]).decode("utf-8")
+                          existing_data = json.loads(decoded)
+                      except Exception:
+                          existing_data = []
+
+                  existing_data.append(log_payload)
+                  # Keep files trimmed to latest 500 records to prevent single file bloat
+                  if len(existing_data) > 500:
+                      existing_data = existing_data[-500:]
+
+                  updated_content = json.dumps(existing_data, indent=2)
+                  encoded_content = base64.b64encode(updated_content.encode("utf-8")).decode("utf-8")
+
+                  payload = {
+                      "message": f"telemetry: archive health log [{file_path}] [skip ci]",
+                      "content": encoded_content,
+                      "branch": "main"
+                  }
+                  if sha:
+                      payload["sha"] = sha
+
+                  requests.put(url, headers=headers, json=payload)
+
+          # --- FEATURE 5: AUTOMATED GITHUB INCIDENT ISSUE TRACKER ---
+          def manage_incident_issue(event_type, details):
+              global active_incident_issue_id
+              if not PAT_TOKEN or not GH_REPO:
+                  return
+
+              headers = {
+                  "Authorization": f"Bearer {PAT_TOKEN}",
+                  "Accept": "application/vnd.github+json"
+              }
+              url = f"https://api.github.com/repos/{GH_REPO}/issues"
+
+              if event_type == "OPEN":
+                  body = (
+                      f"## 🚨 Automated Outage Incident Report\n\n"
+                      f"**Detected At:** `{details['down_time']}`\n"
+                      f"**Endpoint Matrix Status:**\n"
                   )
-                  async with app:
-                      target_group = int(os.environ['TG_CHAT_ID'])
-                      wake_payload = '/leech https://raw.githubusercontent.com/ncw/rclone/master/README.md'
-                      await app.send_message(target_group, wake_payload)
-                      print('[+] Wake payload sent successfully.')
-                      return True
-              except Exception as err:
-                  print(f'[-] Telegram dispatch failed: {err}')
-                  return False
+                  for r in details["results"]:
+                      body += f"- **{r['name']}**: {'🟢 ONLINE' if r['status'] else '🔴 OFFLINE'} (`{r['latency_ms']}ms`)\n"
+                  
+                  payload = {
+                      "title": f"🚨 Service Outage Detected - {details['down_time']}",
+                      "body": body,
+                      "labels": ["incident", "bug", "automated"]
+                  }
+                  res = requests.post(url, headers=headers, json=payload)
+                  if res.status_code in [200, 201]:
+                      active_incident_issue_id = res.json().get("number")
+                      print(f"[+] Created GitHub Incident Issue #{active_incident_issue_id}")
 
-          def check_endpoint_health():
-              """Verifies endpoint health with simple retry logic."""
-              for attempt in range(3):
-                  try:
-                      res = requests.get(TARGET_BOT_URL, timeout=12)
-                      if res.status_code in [200, 302, 503]:
-                          return True
-                  except Exception:
-                      time.sleep(2)
-              return False
+              elif event_type == "CLOSE" and active_incident_issue_id:
+                  issue_url = f"{url}/{active_incident_issue_id}"
+                  body = (
+                      f"## 🟢 Outage Resolved\n\n"
+                      f"**Recovered At:** `{details['up_time']}`\n"
+                      f"**Downtime Duration:** `{details['downtime_duration']}`\n"
+                  )
+                  # Comment resolution
+                  requests.post(f"{issue_url}/comments", headers=headers, json={"body": body})
+                  # Close issue
+                  requests.patch(issue_url, headers=headers, json={"state": "closed"})
+                  print(f"[+] Closed GitHub Incident Issue #{active_incident_issue_id}")
+                  active_incident_issue_id = None
 
-          def send_ntfy_telemetry(bot_healthy, telegram_healthy, metrics):
-              """Sends rich status alerts to ntfy.sh topic."""
-              status_symbol = "🟢" if (bot_healthy and telegram_healthy) else "🔴"
-              priority = "3" if (bot_healthy and telegram_healthy) else "5"
-              title = f"{status_symbol} Sentinel Monitor Report"
+          # --- FEATURE 3: SECONDARY BACKUP NOTIFICATION CHANNEL (DISCORD) ---
+          def send_discord_telemetry(title, message, is_healthy):
+              if not DISCORD_WEBHOOK:
+                  return
+              embed = {
+                  "title": title,
+                  "description": message,
+                  "color": 3066993 if is_healthy else 15158332,
+                  "timestamp": datetime.now(timezone.utc).isoformat()
+              }
+              try:
+                  requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=5)
+              except Exception:
+                  pass
 
-              message = (
-                  f"• Downloader Endpoint: {'ONLINE' if bot_healthy else 'OFFLINE'}\n"
-                  f"• Telegram Dispatch: {'SUCCESS' if telegram_healthy else 'FAILED'}\n"
-                  f"• Host Metrics: {metrics}"
-              )
-
+          def send_ntfy_telemetry(title, message, priority="3"):
+              if not NTFY_TOPIC:
+                  return
               cmd = [
-                  "curl",
-                  "-H", f"X-Priority: {priority}",
+                  "curl", "-H", f"X-Priority: {priority}",
                   "-H", f"X-Title: {title}",
-                  "-d", message,
-                  f"https://ntfy.sh/{NTFY_TOPIC}"
+                  "-d", message, f"https://ntfy.sh/{NTFY_TOPIC}"
               ]
               try:
                   subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-              except Exception as e:
-                  print(f"[-] Telemetry notification error: {e}")
+              except Exception:
+                  pass
 
-          async def main():
-              print("=== Sentinel Daemon Online ===")
-              start_timestamp = time.time()
+          def commit_metrics_markdown(overall_status, results, streak, ram, disk, rate_limit, down_time, up_time):
+              if not PAT_TOKEN or not GH_REPO:
+                  return
 
-              while (time.time() - start_timestamp) < MAX_RUNTIME_SEC:
-                  metrics = get_system_metrics()
-                  telegram_status = await dispatch_telegram_wake()
-                  bot_status = check_endpoint_health()
+              url = f"https://api.github.com/repos/{GH_REPO}/contents/metrics.md"
+              headers = {
+                  "Authorization": f"Bearer {PAT_TOKEN}",
+                  "Accept": "application/vnd.github+json"
+              }
+
+              matrix_rows = ""
+              for r in results:
+                  matrix_rows += f"| **{r['name']}** | {'🟢 ONLINE' if r['status'] else '🔴 OFFLINE'} | `{r['latency_ms']} ms` |\n"
+
+              content_md = (
+                  f"# 📊 System Metrics & Endpoint Matrix\n\n"
+                  f"**Last Updated:** `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}`\n\n"
+                  f"### Endpoint Health\n"
+                  f"| Service Name | Status | Latency |\n"
+                  f"| :--- | :--- | :--- |\n"
+                  f"{matrix_rows}\n"
+                  f"### System Metrics\n"
+                  f"| Metric | Value |\n"
+                  f"| :--- | :--- |\n"
+                  f"| **Overall Status** | {'🟢 ALL SYSTEMS GO' if overall_status else '🔴 DEGRADED'} |\n"
+                  f"| **Last Online At** | `{up_time}` |\n"
+                  f"| **Last Offline At** | `{down_time or 'None (Stable)'}` |\n"
+                  f"| **Streak Count** | `{streak} cycles` |\n"
+                  f"| **Host RAM Usage** | `{ram}%` |\n"
+                  f"| **Host Disk Usage** | `{disk}%` |\n"
+                  f"| **API Rate Limit** | `{rate_limit}` |\n"
+              )
+
+              encoded_content = base64.b64encode(content_md.encode("utf-8")).decode("utf-8")
+              sha = None
+              get_res = requests.get(url, headers=headers)
+              if get_res.status_code == 200:
+                  sha = get_res.json().get("sha")
+
+              payload = {
+                  "message": "docs: update system metrics dashboard [skip ci]",
+                  "content": encoded_content,
+                  "branch": "main"
+              }
+              if sha:
+                  payload["sha"] = sha
+
+              requests.put(url, headers=headers, json=payload)
+
+          def main():
+              global last_status, last_down_time, last_up_time
+              print("=== Sentinel Enterprise Daemon v4.0 Online ===")
+              start_time = time.time()
+              ping_streak = 0
+
+              while (time.time() - start_time) < MAX_RUNTIME_SEC:
+                  elapsed = int(time.time() - start_time)
+                  remaining_time = max(0, (MAX_RUNTIME_SEC - elapsed) // 60)
+                  current_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+                  overall_healthy, results = ping_endpoints()
+                  transition_event = None
+                  downtime_duration_str = None
+
+                  # --- FEATURE 2: ADAPTIVE INTERVAL POLLING ---
+                  current_poll_interval = NORMAL_INTERVAL_SEC if overall_healthy else PANIC_INTERVAL_SEC
+
+                  # State Transitions
+                  if last_status != overall_healthy:
+                      if not overall_healthy:
+                          last_down_time = current_utc_str
+                          transition_event = "🚨 SYSTEM OUTAGE DETECTED"
+                          manage_incident_issue("OPEN", {"down_time": last_down_time, "results": results})
+                      else:
+                          if last_down_time:
+                              down_dt = datetime.strptime(last_down_time, "%Y-%m-%d %H:%M:%S UTC")
+                              curr_dt = datetime.strptime(current_utc_str, "%Y-%m-%d %H:%M:%S UTC")
+                              duration_sec = int((curr_dt - down_dt).total_seconds())
+                              downtime_duration_str = f"{duration_sec // 60}m {duration_sec % 60}s"
+
+                          last_up_time = current_utc_str
+                          transition_event = f"🟢 RECOVERED (Downtime: {downtime_duration_str or 'N/A'})"
+                          manage_incident_issue("CLOSE", {"up_time": last_up_time, "downtime_duration": downtime_duration_str})
+
+                  last_status = overall_healthy
+
+                  if overall_healthy:
+                      ping_streak += 1
+                      history_log.append("🟩")
+                      last_up_time = current_utc_str
+                  else:
+                      ping_streak = 0
+                      history_log.append("🟥")
+                      if not last_down_time:
+                          last_down_time = current_utc_str
+
+                  if len(history_log) > 10:
+                      history_log.pop(0)
+
+                  ram = psutil.virtual_memory().percent
+                  disk = psutil.disk_usage('/').percent
+                  rate_limit = get_github_rate_limit()
+
+                  # Dispatch Telemetry
+                  telemetry_msg = (
+                      f"Status: {'ONLINE' if overall_healthy else 'OFFLINE'}\n"
+                      f"Mode: {'Normal (10m)' if overall_healthy else '🔥 PANIC MODE (2m)'}\n"
+                      f"Last Online: {last_up_time}\n"
+                      f"Last Offline: {last_down_time or 'None'}\n"
+                      f"RAM: {ram}% | Disk: {disk}%"
+                  )
                   
-                  send_ntfy_telemetry(bot_status, telegram_status, metrics)
-                  
-                  print(f"[*] Cycle finished. Metrics: {metrics}. Sleeping {SLEEP_INTERVAL//60} mins...\n")
-                  await asyncio.sleep(SLEEP_INTERVAL)
+                  title = f"{'🟢' if overall_healthy else '🚨'} Sentinel | {transition_event or f'Streak: {ping_streak}'}"
+                  priority = "5" if transition_event else "3"
 
-              print("=== Loop Window Reached. Preparing Container Handoff ===")
+                  send_ntfy_telemetry(title, telemetry_msg, priority)
+                  send_discord_telemetry(title, telemetry_msg, overall_healthy)
+
+                  # Commit Archives & Metrics
+                  archive_json_logs(results, overall_healthy)
+                  commit_metrics_markdown(overall_healthy, results, ping_streak, ram, disk, rate_limit, last_down_time, last_up_time)
+
+                  print(f"\n┌─────────────────────────────────────────────────────────┐")
+                  print(f"│ Status: {'ONLINE 🟢' if overall_healthy else 'OFFLINE 🔴':<47} │")
+                  print(f"│ Poll Mode: {'NORMAL (10 min)' if overall_healthy else '🔥 PANIC (2 min)':<44} │")
+                  print(f"│ Last Online At:  {last_up_time:<39} │")
+                  print(f"│ Last Offline At: {last_down_time or 'None (Stable)':<39} │")
+                  print(f"│ History Bar [10x]: {''.join(history_log):<36} │")
+                  print(f"│ Container Budget Left: {f'{remaining_time} Mins':<32} │")
+                  print(f"└─────────────────────────────────────────────────────────┘")
+                  print(f"[*] Sleeping {current_poll_interval//60} mins until next evaluation...\n")
+
+                  time.sleep(current_poll_interval)
+
+              print("=== Container Limit Reached. Executing Handover ===")
 
           if __name__ == "__main__":
-              asyncio.run(main())
+              main()
           EOF
 
           python sentinel.py
@@ -134,7 +417,9 @@ jobs:
       - name: Auto-Trigger Next Container Cycle
         if: always()
         run: |
-          curl -H "X-Priority: 4" -H "X-Title: 🔄 Handover Triggered" -d "Recycling runner container..." https://ntfy.sh/JAI_HO
+          if [ -n "${{ secrets.NTFY_TOPIC }}" ]; then
+            curl -H "X-Priority: 4" -H "X-Title: 🔄 Handover Triggered" -d "Recycling container cycle..." https://ntfy.sh/${{ secrets.NTFY_TOPIC }}
+          fi
           
           curl -X POST \
             -H "Accept: application/vnd.github+json" \
@@ -142,87 +427,3 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/auto_runner.yaml/dispatches \
             -d '{"ref":"main"}'
-                      api_id=int(os.environ['TG_APP_ID']),
-                      api_hash=os.environ['TG_APP_HASH'],
-                      session_string=os.environ['TG_SESSION'],
-                      in_memory=True
-                  )
-                  async with app:
-                      target_group = int(os.environ['TG_CHAT_ID'])
-                      wake_payload = '/leech https://raw.githubusercontent.com/ncw/rclone/master/README.md'
-                      await app.send_message(target_group, wake_payload)
-                      print('[+] Wake payload sent successfully.')
-                      return True
-              except Exception as err:
-                  print(f'[-] Telegram dispatch failed: {err}')
-                  return False
-
-          def check_endpoint_health():
-              """Verifies endpoint health with simple retry logic."""
-              for attempt in range(3):
-                  try:
-                      res = requests.get(TARGET_BOT_URL, timeout=12)
-                      if res.status_code in [200, 302, 503]:
-                          return True
-                  except Exception:
-                      time.sleep(2)
-              return False
-
-          def send_ntfy_telemetry(bot_healthy, telegram_healthy, metrics):
-              """Sends rich status alerts to ntfy.sh topic."""
-              status_symbol = "🟢" if (bot_healthy and telegram_healthy) else "🔴"
-              priority = "3" if (bot_healthy and telegram_healthy) else "5"
-              title = f"{status_symbol} Sentinel Monitor Report"
-
-              message = (
-                  f"• Downloader Endpoint: {'ONLINE' if bot_healthy else 'OFFLINE'}\n"
-                  f"• Telegram Dispatch: {'SUCCESS' if telegram_healthy else 'FAILED'}\n"
-                  f"• Host Metrics: {metrics}"
-              )
-
-              cmd = [
-                  "curl",
-                  "-H", f"X-Priority: {priority}",
-                  "-H", f"X-Title: {title}",
-                  "-d", message,
-                  f"https://ntfy.sh/{NTFY_TOPIC}"
-              ]
-              try:
-                  subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-              except Exception as e:
-                  print(f"[-] Telemetry notification error: {e}")
-
-          async def main():
-              print("=== Sentinel Daemon Online ===")
-              start_timestamp = time.time()
-
-              while (time.time() - start_timestamp) < MAX_RUNTIME_SEC:
-                  metrics = get_system_metrics()
-                  telegram_status = await dispatch_telegram_wake()
-                  bot_status = check_endpoint_health()
-                  
-                  send_ntfy_telemetry(bot_status, telegram_status, metrics)
-                  
-                  print(f"[*] Cycle finished. Metrics: {metrics}. Sleeping {SLEEP_INTERVAL//60} mins...\n")
-                  await asyncio.sleep(SLEEP_INTERVAL)
-
-              print("=== Loop Window Reached. Preparing Container Handoff ===")
-
-          if __name__ == "__main__":
-              asyncio.run(main())
-          EOF
-
-          python sentinel.py
-
-      - name: Auto-Trigger Next Container Cycle
-        if: always()
-        run: |
-          curl -H "X-Priority: 4" -H "X-Title: 🔄 Handover Triggered" -d "Recycling runner container..." https://ntfy.sh/JAI_HO
-          
-          curl -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/auto_runner.yaml/dispatches \
-            -d '{"ref":"main"}'
-            
