@@ -1,4 +1,4 @@
-name: Wake Leech Bot
+name: System Sentinel Pro
 
 on:
   workflow_dispatch:
@@ -8,32 +8,140 @@ permissions:
   contents: read
 
 jobs:
-  keepalive:
+  sentinel-daemon:
     runs-on: ubuntu-latest
     timeout-minutes: 340
 
     steps:
-      - name: Checkout Code
+      - name: Checkout Codebase
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Initialize Python 3.10 Runtime
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install Dependencies
-        run: pip install pyrogram tgcrypto requests
-
-      - name: Run Smart Group Monitor Loop
-        env:
-          API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          SESSION_STR: ${{ secrets.TG_SESSION_STRING }}
-          TG_GROUP_ID: ${{ secrets.TG_GROUP_ID }}
+      - name: Install High-Performance Dependencies
         run: |
-          cat << 'EOF' > group_loop.py
+          python -m pip install --upgrade pip
+          pip install pyrogram tgcrypto requests psutil
+
+      - name: Launch Sentinel Daemon
+        env:
+          TG_APP_ID: ${{ secrets.TG_APP_ID }}
+          TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          cat << 'EOF' > sentinel.py
           import os
           import time
+          import asyncio
+          import requests
+          import psutil
+          import subprocess
+          from pyrogram import Client
+
+          # System Configuration
+          TARGET_BOT_URL = "https://jjjjjjjj-haps-leech-bot1.hf.space" 
+          NTFY_TOPIC = "JAI_HO"
+          SLEEP_INTERVAL = 600  # 10 Minutes
+          MAX_RUNTIME_SEC = 320 * 60  # ~5.3 Hours
+
+          def get_system_metrics():
+              """Collects container resource metrics."""
+              ram = psutil.virtual_memory()
+              cpu = psutil.cpu_percent(interval=1)
+              return f"RAM: {ram.percent}% | CPU: {cpu}%"
+
+          async def dispatch_telegram_wake():
+              """Dispatches wake payload to the target Telegram Group."""
+              try:
+                  app = Client(
+                      "sentinel_session",
+                      api_id=int(os.environ['TG_APP_ID']),
+                      api_hash=os.environ['TG_APP_HASH'],
+                      session_string=os.environ['TG_SESSION'],
+                      in_memory=True
+                  )
+                  async with app:
+                      target_group = int(os.environ['TG_CHAT_ID'])
+                      wake_payload = '/leech https://raw.githubusercontent.com/ncw/rclone/master/README.md'
+                      await app.send_message(target_group, wake_payload)
+                      print('[+] Wake payload sent successfully.')
+                      return True
+              except Exception as err:
+                  print(f'[-] Telegram dispatch failed: {err}')
+                  return False
+
+          def check_endpoint_health():
+              """Verifies endpoint health with simple retry logic."""
+              for attempt in range(3):
+                  try:
+                      res = requests.get(TARGET_BOT_URL, timeout=12)
+                      if res.status_code in [200, 302, 503]:
+                          return True
+                  except Exception:
+                      time.sleep(2)
+              return False
+
+          def send_ntfy_telemetry(bot_healthy, telegram_healthy, metrics):
+              """Sends rich status alerts to ntfy.sh topic."""
+              status_symbol = "🟢" if (bot_healthy and telegram_healthy) else "🔴"
+              priority = "3" if (bot_healthy and telegram_healthy) else "5"
+              title = f"{status_symbol} Sentinel Monitor Report"
+
+              message = (
+                  f"• Downloader Endpoint: {'ONLINE' if bot_healthy else 'OFFLINE'}\n"
+                  f"• Telegram Dispatch: {'SUCCESS' if telegram_healthy else 'FAILED'}\n"
+                  f"• Host Metrics: {metrics}"
+              )
+
+              cmd = [
+                  "curl",
+                  "-H", f"X-Priority: {priority}",
+                  "-H", f"X-Title: {title}",
+                  "-d", message,
+                  f"https://ntfy.sh/{NTFY_TOPIC}"
+              ]
+              try:
+                  subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              except Exception as e:
+                  print(f"[-] Telemetry notification error: {e}")
+
+          async def main():
+              print("=== Sentinel Daemon Online ===")
+              start_timestamp = time.time()
+
+              while (time.time() - start_timestamp) < MAX_RUNTIME_SEC:
+                  metrics = get_system_metrics()
+                  telegram_status = await dispatch_telegram_wake()
+                  bot_status = check_endpoint_health()
+                  
+                  send_ntfy_telemetry(bot_status, telegram_status, metrics)
+                  
+                  print(f"[*] Cycle finished. Metrics: {metrics}. Sleeping {SLEEP_INTERVAL//60} mins...\n")
+                  await asyncio.sleep(SLEEP_INTERVAL)
+
+              print("=== Loop Window Reached. Preparing Container Handoff ===")
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          EOF
+
+          python sentinel.py
+
+      - name: Auto-Trigger Next Container Cycle
+        if: always()
+        run: |
+          curl -H "X-Priority: 4" -H "X-Title: 🔄 Handover Triggered" -d "Recycling runner container..." https://ntfy.sh/JAI_HO
+          
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/auto_runner.yaml/dispatches \
+            -d '{"ref":"main"}'
           import asyncio
           import requests
           import subprocess
