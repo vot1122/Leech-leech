@@ -1614,5 +1614,21 @@
       "ram_percent": 5.9,
       "disk_percent": 39.5
     }
+  },
+  {
+    "timestamp": "2026-07-24 07:58:19 UTC",
+    "overall_status": "ONLINE",
+    "endpoints": [
+      {
+        "name": "Leech Downloader Bot",
+        "url": "https://jjjjjjjj-haps-leech-bot1.hf.space",
+        "status": true,
+        "latency_ms": 302
+      }
+    ],
+    "metrics": {
+      "ram_percent": 6.0,
+      "disk_percent": 39.5
+    }
   }
 ]
